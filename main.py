@@ -152,12 +152,27 @@ def main(args):
                 logging.error("Data not found. Please run 'dvc pull' to get data.")
                 return
 
-    # Define the data transformation
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    # Resolve optional overrides passed via CLI (fall back to config values)
+    batch_size = getattr(args, 'batch_size', None) or config.BATCH_SIZE
+    learning_rate = getattr(args, 'learning_rate', None) or config.params['train']['learning_rate']
+    optimizer_name = getattr(args, 'optimizer', None) or config.params['train'].get('optimizer', 'adam')
+    augment = getattr(args, 'augment', None)
+
+    # Define the data transformation (with optional augmentation)
+    if augment:
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(0.1, 0.1, 0.1, 0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
     # Initialize the CNN model
     model = Classifier(
@@ -190,16 +205,9 @@ def main(args):
         k_folds = config.params['train']['k_folds']
         kfold = KFold(n_splits=k_folds, shuffle=True, random_state=42)
 
-        # Log experiment-level parameters to MLflow only if enabled
+        # Setup MLflow only if enabled
         if args.use_mlflow:
             setup_mlflow(args.use_mlflow)
-            mlflow.log_param("k_folds", k_folds)
-            mlflow.log_param("total_samples", len(dataset))
-            mlflow.log_param("dataset_path", args.data_path)
-            # Log DVC info if enabled
-            if config.params['dvc']['enabled']:
-                mlflow.log_param("dvc_enabled", True)
-                mlflow.log_param("dvc_remote", config.params['dvc']['remote'])
 
         logging.info("=" * 50)
         logging.info(f"STARTING {k_folds}-FOLD CROSS VALIDATION")
@@ -211,81 +219,110 @@ def main(args):
 
         fold_histories = []
 
+        # Create parent run for cross-validation if MLflow is enabled
+        if args.use_mlflow:
+            parent_run_name = f"cv_{config.BACKBONE}_freeze_{config.FREEZE_BACKBONE}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            parent_run = mlflow.start_run(run_name=parent_run_name)
+            # Log experiment-level parameters to parent run
+            mlflow.log_param("k_folds", k_folds)
+            mlflow.log_param("total_samples", len(dataset))
+            mlflow.log_param("dataset_path", args.data_path)
+            mlflow.log_param("backbone", config.BACKBONE)
+            mlflow.log_param("freeze_backbone", config.FREEZE_BACKBONE)
+            mlflow.log_param("batch_size", config.BATCH_SIZE)
+            mlflow.log_param("max_epochs", config.MAX_EPOCHS_NUM)
+            # Log DVC info if enabled
+            if config.params['dvc']['enabled']:
+                mlflow.log_param("dvc_enabled", True)
+                mlflow.log_param("dvc_remote", config.params['dvc']['remote'])
+        else:
+            parent_run = None
+
         # K-fold Cross Validation model evaluation
-        for fold, (train_ids, val_ids) in enumerate(kfold.split(dataset)):
-            # Print current fold
-            logging.info('')
-            logging.info('=' * 50)
-            logging.info(f'FOLD {fold + 1}/{k_folds}')
-            logging.info('=' * 50)
+        try:
+            for fold, (train_ids, val_ids) in enumerate(kfold.split(dataset)):
+                # Print current fold
+                logging.info('')
+                logging.info('=' * 50)
+                logging.info(f'FOLD {fold + 1}/{k_folds}')
+                logging.info('=' * 50)
 
-            # Sample elements randomly from a given list of ids, no replacement
-            train_subsampler = SubsetRandomSampler(train_ids)
-            val_subsampler = SubsetRandomSampler(val_ids)
+                # Sample elements randomly from a given list of ids, no replacement
+                train_subsampler = SubsetRandomSampler(train_ids)
+                val_subsampler = SubsetRandomSampler(val_ids)
 
-            # Define data loaders for training and validation
-            train_loader = DataLoader(dataset, batch_size=config.BATCH_SIZE, sampler=train_subsampler)
-            val_loader = DataLoader(dataset, batch_size=config.BATCH_SIZE, sampler=val_subsampler)
+                # Define data loaders for training and validation
+                train_loader = DataLoader(dataset, batch_size=batch_size, sampler=train_subsampler)
+                val_loader = DataLoader(dataset, batch_size=batch_size, sampler=val_subsampler)
 
-            # Reinitialize model for each fold
-            model = Classifier(len(config.CLASS_NAMES), backbone=config.BACKBONE,
-                               freeze_backbone=config.FREEZE_BACKBONE)
-            model.to(device)
+                # Reinitialize model for each fold
+                model = Classifier(len(config.CLASS_NAMES), backbone=config.BACKBONE,
+                                   freeze_backbone=config.FREEZE_BACKBONE)
+                model.to(device)
 
-            # Initialize optimizer with learning rate from params
-            optimizer = torch.optim.Adam(model.parameters(), lr=config.params['train']['learning_rate'])
+                # Initialize optimizer with learning rate from params or CLI override
+                if optimizer_name.lower() == 'sgd':
+                    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4)
+                else:
+                    # default to Adam
+                    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-            # Log fold information
-            logging.info(f'''Fold {fold + 1} Details:
+                # Log fold information
+                logging.info(f'''Fold {fold + 1} Details:
     Training size:   {len(train_subsampler)}
     Validation size: {len(val_subsampler)}
     Backbone:        {config.BACKBONE}
     Freeze Backbone: {config.FREEZE_BACKBONE}
-    Batch size:      {config.BATCH_SIZE}
+    Batch size:      {batch_size}
     Epochs:          {config.MAX_EPOCHS_NUM}
-    Learning Rate:   {config.params['train']['learning_rate']}
+    Learning Rate:   {learning_rate}
     Device:          {device}
     MLflow:          {'ENABLED' if args.use_mlflow else 'DISABLED'}
             ''')
 
-            # Train the model for this fold
-            fold_history = train_classifier(
-                model, train_loader, val_loader, criterion, optimizer, config.MAX_EPOCHS_NUM,
-                config.MODEL_DIR, config.PLOTS_DIR, device, config.BACKBONE, config.FREEZE_BACKBONE,
-                fold=fold, use_mlflow=args.use_mlflow
-            )
-            fold_histories.append(fold_history)
+                # Train the model for this fold
+                fold_history = train_classifier(
+                    model, train_loader, val_loader, criterion, optimizer, config.MAX_EPOCHS_NUM,
+                    config.MODEL_DIR, config.PLOTS_DIR, device, config.BACKBONE, config.FREEZE_BACKBONE,
+                    fold=fold, use_mlflow=args.use_mlflow
+                )
+                fold_histories.append(fold_history)
 
-            # Clear GPU cache
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
+                # Clear GPU cache
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
 
-        # Log cross-validation summary and save DVC metrics
-        if fold_histories:
-            avg_best_val_loss = sum(h['best_val_loss'] for h in fold_histories) / len(fold_histories)
-            avg_best_val_accuracy = sum(h['best_val_accuracy'] for h in fold_histories) / len(fold_histories)
+            # Log cross-validation summary and save DVC metrics (after all folds)
+            if fold_histories:
+                avg_best_val_loss = sum(h['best_val_loss'] for h in fold_histories) / len(fold_histories)
+                avg_best_val_accuracy = sum(h['best_val_accuracy'] for h in fold_histories) / len(fold_histories)
 
-            # Save DVC metrics
-            cv_metrics_path = save_cv_metrics(fold_histories, config.PLOTS_DIR)
+                # Save DVC metrics
+                cv_metrics_path = save_cv_metrics(fold_histories, config.PLOTS_DIR)
 
-            if args.use_mlflow:
-                mlflow.log_metrics({
-                    "cv_avg_best_val_loss": avg_best_val_loss,
-                    "cv_avg_best_val_accuracy": avg_best_val_accuracy
-                })
+                if args.use_mlflow:
+                    mlflow.log_metrics({
+                        "cv_avg_best_val_loss": avg_best_val_loss,
+                        "cv_avg_best_val_accuracy": avg_best_val_accuracy
+                    })
 
-                # Log DVC metrics file to MLflow
-                if cv_metrics_path and os.path.exists(cv_metrics_path):
-                    mlflow.log_artifact(cv_metrics_path, "dvc_metrics")
+                    # Log DVC metrics file to MLflow
+                    if cv_metrics_path and os.path.exists(cv_metrics_path):
+                        mlflow.log_artifact(cv_metrics_path, "dvc_metrics")
 
-            logging.info('')
-            logging.info("=" * 50)
-            logging.info("CROSS-VALIDATION SUMMARY")
-            logging.info("=" * 50)
-            logging.info(f'Average best val loss: {avg_best_val_loss:.6f}')
-            logging.info(f'Average best val accuracy: {avg_best_val_accuracy:.2f}%')
-            logging.info("TRAINING COMPLETED SUCCESSFULLY!")
-            logging.info("=" * 50)
+                logging.info('')
+                logging.info("=" * 50)
+                logging.info("CROSS-VALIDATION SUMMARY")
+                logging.info("=" * 50)
+                logging.info(f'Average best val loss: {avg_best_val_loss:.6f}')
+                logging.info(f'Average best val accuracy: {avg_best_val_accuracy:.2f}%')
+                logging.info("TRAINING COMPLETED SUCCESSFULLY!")
+                logging.info("=" * 50)
+        finally:
+            # End parent MLflow run if it was started
+            if args.use_mlflow and parent_run is not None:
+                mlflow.end_run()
+
 
     elif args.mode == "test":
         os.makedirs(config.PLOTS_DIR, exist_ok=True)
@@ -342,6 +379,12 @@ if __name__ == "__main__":
                         help="Force run even if data check fails (for DVC)")
     parser.add_argument("--min_accuracy", type=float, default=0.0,
                         help="Minimum accuracy threshold for test (default: 0.0)")
+    
+    # Hyperparameter overrides
+    parser.add_argument("--batch_size", type=int, help="Override batch size")
+    parser.add_argument("--learning_rate", type=float, help="Override learning rate")
+    parser.add_argument("--optimizer", type=str, choices=["adam", "sgd"], help="Override optimizer")
+    parser.add_argument("--augment", action="store_true", help="Enable data augmentation")
 
     args = parser.parse_args()
 

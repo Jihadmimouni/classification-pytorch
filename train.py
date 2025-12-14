@@ -87,6 +87,7 @@ def train_classifier(model, train_loader, val_loader, criterion, optimizer, num_
 
     # Training metrics
     best_val_loss = float('inf')
+    best_train_accuracy = 0.0
     counter = 0
     patience = 10
     train_losses = []
@@ -118,7 +119,10 @@ def train_classifier(model, train_loader, val_loader, criterion, optimizer, num_
 
     # MLflow context manager only if MLflow is enabled
     if use_mlflow:
-        run_context = mlflow.start_run(run_name=run_name)
+        # Check if there's already an active run (parent run)
+        active_run = mlflow.active_run()
+        # If there's a parent run, make this a nested run
+        run_context = mlflow.start_run(run_name=run_name, nested=(active_run is not None))
     else:
         # Create a dummy context manager that does nothing
         from contextlib import nullcontext
@@ -226,6 +230,7 @@ def train_classifier(model, train_loader, val_loader, criterion, optimizer, num_
             # Early stopping and model saving
             if average_val_loss < best_val_loss:
                 best_val_loss = average_val_loss
+                best_train_accuracy = train_accuracy
                 counter = 0
 
                 # Save model
@@ -252,6 +257,7 @@ def train_classifier(model, train_loader, val_loader, criterion, optimizer, num_
                     mlflow.log_metrics({
                         "best_val_loss": best_val_loss,
                         "best_val_accuracy": val_accuracy,
+                        "best_train_accuracy": train_accuracy,
                         "best_epoch": epoch + 1
                     })
 

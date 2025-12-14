@@ -1,0 +1,5 @@
+Experiment,Run Name,Accuracy,Loss
+exp_baseline_adam,cv_resnet18_freeze_True_20251214_144627,52.16095795043164,inf
+exp_optimizer_sgd,cv_resnet18_freeze_True_20251214_144927,52.16095795043164,inf
+exp_lr_high,cv_resnet18_freeze_True_20251214_145227,52.16095795043164,inf
+exp_augmentation,cv_resnet18_freeze_True_20251214_145527,52.16095795043164,inf
